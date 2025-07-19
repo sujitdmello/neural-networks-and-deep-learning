@@ -29,7 +29,7 @@ class DrawingApp:
     def __init__(self, root):
         self.root = root
         self.root.title("Drawing Canvas")
-        self.root.geometry("800x500")  # Increased width to accommodate side panel
+        self.root.geometry("500x500")  # Compact size: 280 (canvas) + 140 (processed) + padding
         
         # Drawing variables
         self.old_x = None
@@ -145,7 +145,7 @@ class DrawingApp:
         
         # Left side frame for the drawing canvas
         left_frame = ttk.Frame(canvas_frame)
-        left_frame.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        left_frame.pack(side=tk.LEFT, fill=tk.Y, expand=False)
         
         # Create canvas with scrollbars
         self.canvas = tk.Canvas(
@@ -159,21 +159,12 @@ class DrawingApp:
         # Draw grid lines to guide digit placement
         self.draw_grid_lines()
         
-        # Scrollbars
-        v_scrollbar = ttk.Scrollbar(left_frame, orient=tk.VERTICAL, command=self.canvas.yview)
-        h_scrollbar = ttk.Scrollbar(left_frame, orient=tk.HORIZONTAL, command=self.canvas.xview)
-        
-        self.canvas.configure(yscrollcommand=v_scrollbar.set, xscrollcommand=h_scrollbar.set)
-        self.canvas.configure(scrollregion=self.canvas.bbox("all"))
-        
-        # Pack scrollbars and canvas
-        self.canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-        v_scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
-        h_scrollbar.pack(side=tk.BOTTOM, fill=tk.X)
+        # Pack canvas without scrollbars
+        self.canvas.pack(side=tk.LEFT, fill=tk.NONE, expand=False)
         
         # Right side frame for processed image display
         right_frame = ttk.Frame(canvas_frame)
-        right_frame.pack(side=tk.RIGHT, fill=tk.Y, padx=(10, 0))
+        right_frame.pack(side=tk.LEFT, fill=tk.Y, padx=(1, 0))
         
         # Processed image label
         processed_label = ttk.Label(right_frame, text="Processed Image (28x28):", font=("Arial", 10, "bold"))
@@ -206,7 +197,7 @@ class DrawingApp:
         
         # Text box for recognized digit display
         self.result_var = tk.StringVar()
-        self.result_var.set("Draw and recognize")
+        self.result_var.set("Draw a digit")
         result_display = ttk.Label(
             right_frame,
             textvariable=self.result_var,
@@ -648,13 +639,11 @@ class DrawingApp:
         try:
             from scipy import ndimage
             # Create a structuring element (small cross pattern for thickening)
-            structure = np.array([[0, 1, 0],
-                                 [1, 1, 1], 
-                                 [0, 1, 0]], dtype=bool)
+            structure = np.array([[1,1,1],[1,1,1],[1,1,1]], dtype=bool)
             
             # Apply dilation before thresholding to thicken the strokes
             # First, create a binary mask of the drawn areas
-            binary_mask = img_array < 200  # Areas that are not pure white
+            binary_mask = img_array < 220  # Areas that are not pure white
             dilated_mask = ndimage.binary_dilation(binary_mask, structure=structure, iterations=1)
             
             # Apply the dilation effect: make dilated areas darker
@@ -706,7 +695,7 @@ class DrawingApp:
         img_display = (img_2d * 255).astype(np.uint8)
         
         # Create PIL image
-        pil_img = Image.fromarray(img_display, mode='L')
+        pil_img = Image.fromarray(img_display)
         
         # Scale up for better visibility (28x28 -> 140x140, 5x scaling)
         pil_img = pil_img.resize((140, 140), Image.Resampling.NEAREST)
