@@ -639,7 +639,7 @@ class DrawingApp:
         try:
             from scipy import ndimage
             # Create a structuring element (small cross pattern for thickening)
-            structure = np.array([[1,1,1],[1,1,1],[1,1,1]], dtype=bool)
+            structure = np.array([[0,1,0],[0,1,0],[0,1,0]], dtype=bool)
             
             # Apply dilation before thresholding to thicken the strokes
             # First, create a binary mask of the drawn areas
@@ -652,7 +652,7 @@ class DrawingApp:
             # Apply gentler threshold after dilation
             threshold = 200  # Adjusted threshold after dilation
             img_array = np.where(img_array < threshold, 
-                               img_array * 0.8,  # Less aggressive darkening after dilation
+                               img_array * 0.5,  # Less aggressive darkening after dilation
                                255.0)             # Keep light areas white
         except ImportError:
             # Fallback: use more aggressive thresholding to simulate thickening
