@@ -4,6 +4,8 @@ This is a fork of [Michael Nielsen](https://github.com/mnielsen/neural-networks-
 
 A UI application has been added that allows easy access to the training process and also testing the network. It may be useful to those wishing to learn the inner workings of the neural network. The UX code has been largely written by GitHub Copilot Agent with extensive prompting.
 
+<img width="751" height="794" alt="image" src="https://github.com/user-attachments/assets/f07d4abe-6c0e-450f-84db-9e0b05e5c506" />
+
 # Code samples for "Neural Networks and Deep Learning"
 
 This repository contains code samples for my book on ["Neural Networks
