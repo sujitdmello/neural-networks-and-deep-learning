@@ -135,6 +135,44 @@ class Network(object):
         \partial a for the output activations."""
         return (output_activations-y)
 
+    def save_network(self, filename):
+        """Save the network's weights and biases to a file."""
+        import pickle
+        data = {
+            'sizes': self.sizes,
+            'weights': self.weights,
+            'biases': self.biases
+        }
+        with open(filename, 'wb') as f:
+            pickle.dump(data, f)
+    
+    def load_network(self, filename):
+        """Load the network's weights and biases from a file."""
+        import pickle
+        with open(filename, 'rb') as f:
+            data = pickle.load(f)
+        
+        # Verify the network architecture matches
+        if data['sizes'] != self.sizes:
+            raise ValueError(f"Network architecture mismatch. "
+                           f"Expected {self.sizes}, got {data['sizes']}")
+        
+        self.weights = data['weights']
+        self.biases = data['biases']
+
+    @staticmethod
+    def from_file(filename):
+        """Create a network instance from a saved file."""
+        import pickle
+        with open(filename, 'rb') as f:
+            data = pickle.load(f)
+        
+        # Create new network with the saved architecture
+        net = Network(data['sizes'])
+        net.weights = data['weights']
+        net.biases = data['biases']
+        return net
+
 #### Miscellaneous functions
 def sigmoid(z):
     """The sigmoid function."""
