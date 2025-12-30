@@ -2,6 +2,10 @@
 
 This is a fork of [Michael Nielsen](https://github.com/mnielsen/neural-networks-and-deep-learning) repository and is meant to be updated with the latest python and dependency versions. Most things have been updated and currently work. Any help is appreciated and if you spotted any problems, please open an issue and/or a PR.
 
+## Requirements
+
+**Python > 3.11 is required** to run this code.
+
 A UI application has been added that allows easy access to the training process and also testing the network. It may be useful to those wishing to learn the inner workings of the neural network. The UX code has been largely written by GitHub Copilot Agent with extensive prompting.
 
 <img width="751" height="794" alt="image" src="https://github.com/user-attachments/assets/f07d4abe-6c0e-450f-84db-9e0b05e5c506" />
