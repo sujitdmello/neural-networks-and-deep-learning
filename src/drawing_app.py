@@ -1,21 +1,21 @@
 """
-Drawing Canvas Application
+MNIST Digit Recognizer
 
-A simple Python application that allows users to draw on a canvas using the mouse.
-Features include:
-- Mouse drawing with customizable brush size and color
-- Clear canvas functionality
-- Save drawing as PNG image
-- Color picker
-- Brush size adjustment
+A GUI application for training a neural network on MNIST data and then
+drawing digits by hand to test recognition. Features:
+- Draw digits with the mouse; auto-recognized on pen-up
+- Confidence bar chart for all 10 digit classes
+- Progress bar during training with per-epoch accuracy
+- Save / load trained networks
+- Browse random MNIST training samples
 """
 
 import tkinter as tk
-from tkinter import ttk, colorchooser, filedialog, messagebox
-from PIL import Image, ImageDraw
+from tkinter import ttk, filedialog, messagebox
+from PIL import Image, ImageDraw, ImageTk
 import os
 import numpy as np
-import pickle
+import random
 import threading
 
 # Import the neural network modules
@@ -24,710 +24,512 @@ sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 import network
 import mnist_loader
 
+# -- Colour palette ---------------------------------------------------------
+BG = "#f0f0f0"
+CANVAS_BG = "#ffffff"
+ACCENT = "#2563eb"        # blue-600
+ACCENT_LIGHT = "#dbeafe"  # blue-100
+BAR_BG = "#e5e7eb"        # gray-200
+SUCCESS = "#16a34a"       # green-600
+MUTED = "#6b7280"         # gray-500
+
 
 class DrawingApp:
+    """Main application class."""
+
+    # -- init ----------------------------------------------------------------
     def __init__(self, root):
         self.root = root
-        self.root.title("Drawing Canvas")
-        self.root.geometry("500x500")  # Compact size: 280 (canvas) + 140 (processed) + padding
-        
-        # Drawing variables
+        self.root.title("MNIST Digit Recognizer")
+        self.root.geometry("720x520")
+        self.root.minsize(680, 480)
+        self.root.configure(bg=BG)
+
+        # Drawing state
         self.old_x = None
         self.old_y = None
-        self.brush_size = 5
-        self.brush_color = "black"
-        self.canvas_width = 280  # Made it 280 for better 28x28 scaling
+        self.brush_size = 14  # thicker default for digit-sized strokes
+        self.canvas_width = 280
         self.canvas_height = 280
-        
-        # Create PIL Image for saving
+
+        # PIL mirror of the canvas (always in sync)
         self.image = Image.new("RGB", (self.canvas_width, self.canvas_height), "white")
         self.image_draw = ImageDraw.Draw(self.image)
-        
-        # Neural network variables
+
+        # Neural-network state
         self.net = None
         self.training_data = None
         self.test_data = None
         self.is_training = False
-        
-        # Store photo references to prevent garbage collection
-        self.photo_refs = []
-        
-        self.setup_ui()
-        self.bind_events()
-    
-    def setup_ui(self):
-        """Set up the user interface"""
-        # Main frame
-        main_frame = ttk.Frame(self.root)
-        main_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
-        
-        # Control panel - First row
-        control_frame1 = ttk.Frame(main_frame)
-        control_frame1.pack(fill=tk.X, pady=(0, 5))
-        
-        # Brush size control
-        ttk.Label(control_frame1, text="Brush Size:").pack(side=tk.LEFT, padx=(0, 5))
-        self.size_var = tk.IntVar(value=self.brush_size)
-        size_scale = ttk.Scale(
-            control_frame1, 
-            from_=1, 
-            to=20, 
-            orient=tk.HORIZONTAL, 
-            variable=self.size_var,
-            command=self.update_brush_size,
-            length=100
+
+        # Auto-recognize timer id (so we can cancel/reset)
+        self._recognize_after_id = None
+
+        # ImageTk references (prevent GC)
+        self._photo_refs = []
+
+        self._build_ui()
+        self._bind_events()
+
+        # Try to auto-load a saved network on startup
+        self._try_autoload_network()
+
+    # -- UI construction -----------------------------------------------------
+    def _build_ui(self):
+        style = ttk.Style()
+        style.configure("Accent.TButton", font=("Segoe UI", 9, "bold"))
+
+        # ── top toolbar ────────────────────────────────────────────────────
+        toolbar = ttk.Frame(self.root)
+        toolbar.pack(fill=tk.X, padx=10, pady=(8, 4))
+
+        ttk.Label(toolbar, text="Brush:").pack(side=tk.LEFT)
+        self._size_var = tk.IntVar(value=self.brush_size)
+        ttk.Scale(
+            toolbar, from_=6, to=28, orient=tk.HORIZONTAL,
+            variable=self._size_var, command=self._on_brush_size,
+            length=90,
+        ).pack(side=tk.LEFT, padx=(2, 12))
+
+        ttk.Button(toolbar, text="Clear  (C)", command=self.clear_canvas).pack(side=tk.LEFT, padx=(0, 16))
+
+        ttk.Separator(toolbar, orient=tk.VERTICAL).pack(side=tk.LEFT, fill=tk.Y, padx=6)
+
+        self._train_btn = ttk.Button(toolbar, text="Train Network", command=self.train_network)
+        self._train_btn.pack(side=tk.LEFT, padx=(6, 4))
+        ttk.Button(toolbar, text="Save", command=self.save_network_file).pack(side=tk.LEFT, padx=2)
+        ttk.Button(toolbar, text="Load", command=self.load_network_file).pack(side=tk.LEFT, padx=2)
+
+        ttk.Separator(toolbar, orient=tk.VERTICAL).pack(side=tk.LEFT, fill=tk.Y, padx=6)
+
+        ttk.Button(toolbar, text="Sample MNIST", command=self.show_random_training_image).pack(side=tk.LEFT, padx=4)
+
+        # network-status indicator (right side)
+        self._net_status_var = tk.StringVar(value="No network loaded")
+        ttk.Label(toolbar, textvariable=self._net_status_var, foreground=MUTED,
+                  font=("Segoe UI", 8)).pack(side=tk.RIGHT)
+
+        # ── training progress bar (always packed, but hidden via height) ──
+        self._progress_frame = ttk.Frame(self.root)
+        self._progress_frame.pack(fill=tk.X, padx=10)
+        self._progress_frame.pack_forget()  # start hidden
+        self._progress_var = tk.DoubleVar()
+        self._progress_bar = ttk.Progressbar(
+            self._progress_frame, variable=self._progress_var,
+            maximum=100, length=400,
         )
-        size_scale.pack(side=tk.LEFT, padx=(0, 20))
-        
-        # Color button
-        self.color_button = tk.Button(
-            control_frame1,
-            text="Choose Color",
-            bg=self.brush_color,
-            command=self.choose_color,
-            width=12
-        )
-        self.color_button.pack(side=tk.LEFT, padx=(0, 10))
-        
-        # Clear button
-        clear_button = ttk.Button(
-            control_frame1,
-            text="Clear Canvas",
-            command=self.clear_canvas
-        )
-        clear_button.pack(side=tk.LEFT)
-        
-        # Control panel - Second row
-        control_frame2 = ttk.Frame(main_frame)
-        control_frame2.pack(fill=tk.X, pady=(0, 10))
-        
-        # Neural Network buttons
-        train_button = ttk.Button(
-            control_frame2,
-            text="Train Network",
-            command=self.train_network
-        )
-        train_button.pack(side=tk.LEFT, padx=(0, 10))
-        
-        recognize_button = ttk.Button(
-            control_frame2,
-            text="Recognize Digit",
-            command=self.recognize_digit
-        )
-        recognize_button.pack(side=tk.LEFT, padx=(0, 20))
-        
-        # Save/Load Network buttons
-        save_net_button = ttk.Button(
-            control_frame2,
-            text="Save Network",
-            command=self.save_network_file
-        )
-        save_net_button.pack(side=tk.LEFT, padx=(0, 10))
-        
-        load_net_button = ttk.Button(
-            control_frame2,
-            text="Load Network",
-            command=self.load_network_file
-        )
-        load_net_button.pack(side=tk.LEFT)
-        
-        # Show training data button
-        show_data_button = ttk.Button(
-            control_frame2,
-            text="Show Training Data",
-            command=self.show_random_training_image
-        )
-        show_data_button.pack(side=tk.LEFT, padx=(10, 0))
-        
-        # Canvas frame
-        canvas_frame = ttk.Frame(main_frame)
-        canvas_frame.pack(fill=tk.BOTH, expand=True)
-        
-        # Left side frame for the drawing canvas
-        left_frame = ttk.Frame(canvas_frame)
-        left_frame.pack(side=tk.LEFT, fill=tk.Y, expand=False)
-        
-        # Create canvas with scrollbars
+        self._progress_bar.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 6))
+        self._progress_label = ttk.Label(self._progress_frame, text="", width=28)
+        self._progress_label.pack(side=tk.LEFT, padx=(0, 10))
+
+        # ── main content area ──────────────────────────────────────────────
+        body = ttk.Frame(self.root)
+        body.pack(fill=tk.BOTH, expand=True, padx=10, pady=(4, 10))
+
+        # -- left: drawing canvas
+        left = ttk.Frame(body)
+        left.pack(side=tk.LEFT, fill=tk.Y)
+
         self.canvas = tk.Canvas(
-            left_frame,
-            bg="white",
-            width=self.canvas_width,
-            height=self.canvas_height,
-            cursor="crosshair"
+            left, bg=CANVAS_BG,
+            width=self.canvas_width, height=self.canvas_height,
+            cursor="crosshair", highlightthickness=1,
+            highlightbackground="#d1d5db",
         )
-        
-        # Draw grid lines to guide digit placement
-        self.draw_grid_lines()
-        
-        # Pack canvas without scrollbars
-        self.canvas.pack(side=tk.LEFT, fill=tk.NONE, expand=False)
-        
-        # Right side frame for processed image display
-        right_frame = ttk.Frame(canvas_frame)
-        right_frame.pack(side=tk.LEFT, fill=tk.Y, padx=(1, 0))
-        
-        # Processed image label
-        processed_label = ttk.Label(right_frame, text="Processed Image (28x28):", font=("Arial", 10, "bold"))
-        processed_label.pack(pady=(0, 5))
-        
-        # Canvas for processed image
-        self.processed_canvas = tk.Canvas(
-            right_frame,
-            bg="white",
-            width=140,  # 28x28 scaled up by 5x
-            height=140,
-            relief=tk.SUNKEN,
-            borderwidth=2
+        self.canvas.pack()
+        self._draw_canvas_hint()
+
+        # -- right: results panel
+        right = ttk.Frame(body)
+        right.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(14, 0))
+
+        # Predicted digit – large display
+        self._digit_var = tk.StringVar(value="–")
+        digit_display = tk.Label(
+            right, textvariable=self._digit_var,
+            font=("Segoe UI", 64, "bold"), fg=ACCENT, bg=CANVAS_BG,
+            width=3, relief=tk.FLAT, bd=0,
         )
-        self.processed_canvas.pack()
-        
-        # Description label
-        self.processed_desc = ttk.Label(
-            right_frame, 
-            text="Gently enhanced for\nbetter neural network input", 
-            font=("Arial", 8),
-            foreground="gray",
-            justify=tk.CENTER
+        digit_display.pack(pady=(0, 2))
+
+        self._confidence_var = tk.StringVar(value="Draw a digit to begin")
+        ttk.Label(right, textvariable=self._confidence_var,
+                  foreground=MUTED, font=("Segoe UI", 9)).pack()
+
+        # Confidence bar chart
+        chart_frame = ttk.LabelFrame(right, text="Class probabilities")
+        chart_frame.pack(fill=tk.BOTH, expand=True, pady=(8, 0))
+
+        self._bar_canvas = tk.Canvas(chart_frame, bg=CANVAS_BG,
+                                     highlightthickness=0, height=180)
+        self._bar_canvas.pack(fill=tk.BOTH, expand=True, padx=6, pady=6)
+        self._bar_canvas.bind("<Configure>", lambda e: self._draw_empty_bars())
+
+        # Processed-image thumbnail (small, bottom-right)
+        thumb_frame = ttk.Frame(right)
+        thumb_frame.pack(anchor=tk.E, pady=(6, 0))
+        ttk.Label(thumb_frame, text="28×28 input:", foreground=MUTED,
+                  font=("Segoe UI", 8)).pack(side=tk.LEFT, padx=(0, 4))
+        self._thumb_canvas = tk.Canvas(
+            thumb_frame, bg=CANVAS_BG, width=56, height=56,
+            highlightthickness=1, highlightbackground="#d1d5db",
         )
-        self.processed_desc.pack(pady=(5, 0))
-        
-        # Recognition result section
-        result_label = ttk.Label(right_frame, text="Recognized Digit:", font=("Arial", 10, "bold"))
-        result_label.pack(pady=(15, 5))
-        
-        # Text box for recognized digit display
-        self.result_var = tk.StringVar()
-        self.result_var.set("Draw a digit")
-        result_display = ttk.Label(
-            right_frame,
-            textvariable=self.result_var,
-            font=("Arial", 14, "bold"),
-            foreground="blue",
-            background="white",
-            relief=tk.SUNKEN,
-            borderwidth=2,
-            padding=10,
-            justify=tk.CENTER
-        )
-        result_display.pack(pady=(0, 10), fill=tk.X)
-        
-        # Status bar
-        self.status_var = tk.StringVar()
-        self.status_var.set("Draw a digit (0-9) on the canvas, then click 'Recognize Digit'")
-        status_bar = ttk.Label(main_frame, textvariable=self.status_var, relief=tk.SUNKEN)
-        status_bar.pack(fill=tk.X, pady=(10, 0))
-        
-        # Instructions
-        instructions = ttk.Label(
-            main_frame, 
-            text="Instructions: Draw clearly in the center of the canvas. Train the network first for better accuracy.",
-            font=("Arial", 9),
-            foreground="gray"
-        )
-        instructions.pack(fill=tk.X, pady=(5, 0))
-    
-    def bind_events(self):
-        """Bind mouse events to canvas"""
-        self.canvas.bind("<Button-1>", self.start_drawing)
-        self.canvas.bind("<B1-Motion>", self.draw)
-        self.canvas.bind("<ButtonRelease-1>", self.stop_drawing)
-    
-    def draw_grid_lines(self):
-        """Draw grid lines on the canvas to guide digit placement"""
-        # Grid spacing - divide canvas into sections
-        grid_spacing = 35  # 280/8 = 35, creating an 8x8 grid
-        
-        # Draw vertical lines
-        for x in range(grid_spacing, self.canvas_width, grid_spacing):
-            self.canvas.create_line(
-                x, 0, x, self.canvas_height,
-                fill="lightgray",
-                width=1,
-                tags="grid"
-            )
-        
-        # Draw horizontal lines
-        for y in range(grid_spacing, self.canvas_height, grid_spacing):
-            self.canvas.create_line(
-                0, y, self.canvas_width, y,
-                fill="lightgray",
-                width=1,
-                tags="grid"
-            )
-        
-        # Draw a center cross to help with digit centering
-        center_x = self.canvas_width // 2
-        center_y = self.canvas_height // 2
-        
-        # Vertical center line
-        self.canvas.create_line(
-            center_x, 0, center_x, self.canvas_height,
-            fill="lightblue",
-            width=2,
-            tags="grid"
-        )
-        
-        # Horizontal center line
-        self.canvas.create_line(
-            0, center_y, self.canvas_width, center_y,
-            fill="lightblue",
-            width=2,
-            tags="grid"
-        )
-        
-        # Draw a suggested digit area (center 180x180 area)
-        margin = 50  # (280-180)/2 = 50, increased from 70 for larger drawing area
-        self.canvas.create_rectangle(
-            margin, margin, 
-            self.canvas_width - margin, self.canvas_height - margin,
-            outline="lightcoral",
-            width=2,
-            tags="grid"
-        )
-        
-        # Add text instructions
+        self._thumb_canvas.pack(side=tk.LEFT)
+
+        # ── status bar ─────────────────────────────────────────────────────
+        self._status_var = tk.StringVar(value="Draw a digit and it will be recognized automatically.")
+        ttk.Label(self.root, textvariable=self._status_var,
+                  relief=tk.SUNKEN, anchor=tk.W,
+                  font=("Segoe UI", 8)).pack(fill=tk.X, side=tk.BOTTOM)
+
+    # -- canvas hint text (placeholder when empty)
+    def _draw_canvas_hint(self):
+        cx, cy = self.canvas_width // 2, self.canvas_height // 2
         self.canvas.create_text(
-            center_x, 25,
-            text="Draw digit in the center area",
-            fill="gray",
-            font=("Arial", 10),
-            tags="grid"
+            cx, cy, text="Draw here",
+            fill="#c0c0c0", font=("Segoe UI", 18), tags="hint",
         )
-        
-    def start_drawing(self, event):
-        """Start drawing when mouse is pressed"""
+
+    # -- empty bar chart placeholder
+    def _draw_empty_bars(self):
+        self._draw_bars(np.zeros(10))
+
+    # -- event bindings ------------------------------------------------------
+    def _bind_events(self):
+        self.canvas.bind("<Button-1>", self._start_drawing)
+        self.canvas.bind("<B1-Motion>", self._draw)
+        self.canvas.bind("<ButtonRelease-1>", self._stop_drawing)
+        self.root.bind_all("<KeyPress-c>", lambda e: self.clear_canvas())
+        self.root.bind_all("<KeyPress-C>", lambda e: self.clear_canvas())
+
+    # -- drawing -------------------------------------------------------------
+    def _start_drawing(self, event):
+        # Remove the hint text on first stroke
+        self.canvas.delete("hint")
         self.old_x = event.x
         self.old_y = event.y
-        
-    def draw(self, event):
-        """Draw while mouse is being dragged"""
-        if self.old_x and self.old_y:
-            # Draw on tkinter canvas
+        # Cancel any pending auto-recognize
+        if self._recognize_after_id:
+            self.root.after_cancel(self._recognize_after_id)
+            self._recognize_after_id = None
+
+    def _draw(self, event):
+        if self.old_x is not None and self.old_y is not None:
             self.canvas.create_line(
                 self.old_x, self.old_y, event.x, event.y,
-                width=self.brush_size,
-                fill=self.brush_color,
-                capstyle=tk.ROUND,
-                smooth=tk.TRUE
+                width=self.brush_size, fill="black",
+                capstyle=tk.ROUND, smooth=tk.TRUE,
             )
-            
-            # Draw on PIL image for saving
             self.image_draw.line(
                 [self.old_x, self.old_y, event.x, event.y],
-                fill=self.brush_color,
-                width=self.brush_size
+                fill="black", width=self.brush_size,
             )
-            
         self.old_x = event.x
         self.old_y = event.y
-        
-        # Update status
-        self.status_var.set(f"Drawing at ({event.x}, {event.y})")
-    
-    def stop_drawing(self, event):
-        """Stop drawing when mouse is released"""
+
+    def _stop_drawing(self, event):
         self.old_x = None
         self.old_y = None
-        self.status_var.set("Ready to draw!")
-    
-    def update_brush_size(self, value):
-        """Update brush size from scale widget"""
+        # Schedule auto-recognize after a longer pause (1500 ms) so the user
+        # has time to lift the pen between strokes (e.g. digits 4, 5, 8).
+        if self._recognize_after_id:
+            self.root.after_cancel(self._recognize_after_id)
+        self._recognize_after_id = self.root.after(1500, self._auto_recognize)
+
+    def _auto_recognize(self):
+        """Silently run recognition if a network is loaded."""
+        self._recognize_after_id = None
+        if self.net is not None:
+            self.recognize_digit()
+
+    # -- brush size ----------------------------------------------------------
+    def _on_brush_size(self, value):
         self.brush_size = int(float(value))
-        self.status_var.set(f"Brush size: {self.brush_size}")
-    
-    def choose_color(self):
-        """Open color chooser dialog"""
-        color = colorchooser.askcolor(color=self.brush_color)[1]
-        if color:
-            self.brush_color = color
-            self.color_button.config(bg=color)
-            self.status_var.set(f"Color changed to {color}")
-    
+
+    # -- clear ---------------------------------------------------------------
     def clear_canvas(self):
-        """Clear the canvas"""
         self.canvas.delete("all")
-        # Reset PIL image
         self.image = Image.new("RGB", (self.canvas_width, self.canvas_height), "white")
         self.image_draw = ImageDraw.Draw(self.image)
-        # Redraw grid lines
-        self.draw_grid_lines()
-        # Reset result display
-        self.result_var.set("Draw and recognize")
-        # Clear processed image canvas
-        self.processed_canvas.delete("all")
-        self.status_var.set("Canvas cleared!")
-    
-    def train_network(self):
-        """Train the neural network with MNIST data"""
-        if self.is_training:
-            messagebox.showwarning("Training", "Network is already training!")
-            return
-            
-        result = messagebox.askyesno(
-            "Train Network", 
-            "This will train the neural network with MNIST data.\n"
-            "Training may take several minutes. Continue?"
-        )
-        
-        if not result:
-            return
-            
-        # Start training in a separate thread to avoid blocking the UI
-        training_thread = threading.Thread(target=self._train_network_thread)
-        training_thread.daemon = True
-        training_thread.start()
-    
-    def _train_network_thread(self):
-        """Training thread to avoid blocking the UI"""
+        self._draw_canvas_hint()
+        self._digit_var.set("–")
+        self._confidence_var.set("Draw a digit to begin")
+        self._draw_bars(np.zeros(10))
+        self._thumb_canvas.delete("all")
+        self._status_var.set("Canvas cleared.")
+
+    # -- network status helpers ----------------------------------------------
+    def _set_net_status(self, text, colour=MUTED):
+        self._net_status_var.set(text)
+
+    def _try_autoload_network(self):
+        """Silently load trained_network.pkl if it exists next to the script."""
         try:
-            self.is_training = True
-            self.status_var.set("Loading MNIST data...")
-            
-            # Load MNIST data
+            self.net = network.Network.from_file("trained_network.pkl")
+            self._set_net_status(f"Loaded: {self.net.sizes}")
+            self._status_var.set("Network auto-loaded from trained_network.pkl. Draw a digit!")
+        except Exception:
+            pass
+
+    # -- training ------------------------------------------------------------
+    def train_network(self):
+        if self.is_training:
+            messagebox.showwarning("Training", "Training is already in progress.")
+            return
+
+        if not messagebox.askyesno(
+            "Train Network",
+            "Train on MNIST data (30 epochs).\nThis may take a few minutes. Continue?",
+        ):
+            return
+
+        self.is_training = True
+        self._train_btn.configure(state=tk.DISABLED)
+        self._progress_frame.pack(fill=tk.X, padx=10, after=self.root.winfo_children()[0])
+        self._progress_var.set(0)
+        self._progress_label.configure(text="Loading data…")
+
+        t = threading.Thread(target=self._train_thread, daemon=True)
+        t.start()
+
+    def _train_thread(self):
+        epochs = 30
+        try:
+            # Load data
+            self.root.after(0, lambda: self._status_var.set("Loading MNIST data…"))
             try:
-                training_data, validation_data, test_data = mnist_loader.load_data_wrapper()
-                self.training_data = list(training_data)
-                self.test_data = list(test_data)
-            except Exception as load_error:
-                error_msg = f"Failed to load MNIST data:\n{str(load_error)}"
-                self.root.after(0, lambda msg=error_msg: messagebox.showerror("Error", msg))
+                tr, _val, te = mnist_loader.load_data_wrapper()
+                self.training_data = list(tr)
+                self.test_data = list(te)
+            except Exception as e:
+                self.root.after(0, lambda: messagebox.showerror("Error", f"Failed to load MNIST data:\n{e}"))
                 return
-            
-            self.status_var.set("Initializing neural network...")
-            
-            # Create neural network (784 inputs, 30 hidden, 10 outputs)
+
+            self.root.after(0, lambda: self._progress_label.configure(text="Initialising…"))
             self.net = network.Network([784, 100, 10])
-            
-            self.status_var.set("Training neural network... This may take a few minutes.")
-            
-            # Train the network
+
+            def _epoch_cb(epoch, total, accuracy):
+                pct = (epoch + 1) / total * 100
+                acc_str = f"{accuracy:.1%}" if accuracy is not None else "–"
+                self.root.after(0, lambda: self._progress_var.set(pct))
+                self.root.after(0, lambda: self._progress_label.configure(
+                    text=f"Epoch {epoch + 1}/{total}  acc {acc_str}"))
+                self.root.after(0, lambda: self._status_var.set(
+                    f"Training… epoch {epoch + 1}/{total}  accuracy {acc_str}"))
+
             self.net.SGD(
-                self.training_data, 
-                epochs=30, 
-                mini_batch_size=10, 
-                eta=3.0,
-                test_data=self.test_data
+                self.training_data, epochs=epochs, mini_batch_size=10,
+                eta=3.0, test_data=self.test_data, epoch_callback=_epoch_cb,
             )
-            
-            self.status_var.set("Training completed! Network is ready for digit recognition.")
-            
-            # Save the trained network
-            self.save_trained_network()
-            
-        except Exception as train_error:
-            error_msg = f"Error during training:\n{str(train_error)}"
-            self.root.after(0, lambda msg=error_msg: messagebox.showerror("Training Error", msg))
+
+            # Auto-save
+            try:
+                self.net.save_network("trained_network.pkl")
+            except Exception:
+                pass
+
+            self.root.after(0, lambda: self._set_net_status(f"Trained: {self.net.sizes}"))
+            self.root.after(0, lambda: self._status_var.set(
+                "Training complete! Network saved. Draw a digit to test."))
+        except Exception as e:
+            self.root.after(0, lambda: messagebox.showerror("Training Error", str(e)))
         finally:
             self.is_training = False
-    
-    def save_trained_network(self):
-        """Save the trained network to a file"""
-        if self.net is None:
-            return
-        try:
-            self.net.save_network('trained_network.pkl')
-            self.status_var.set("Training completed and network saved!")
-        except Exception as e:
-            print(f"Failed to save network: {e}")
-    
-    def load_trained_network(self):
-        """Load a previously trained network"""
-        try:
-            self.net = network.Network.from_file('trained_network.pkl')
-            return True
-        except FileNotFoundError:
-            return False
-        except Exception as e:
-            print(f"Failed to load network: {e}")
-            return False
-    
-    def save_network_file(self):
-        """Save the trained network to a user-selected file"""
-        if self.net is None:
-            messagebox.showwarning("No Network", "No trained network to save!")
-            return
-        
-        try:
-            file_path = filedialog.asksaveasfilename(
-                defaultextension=".pkl",
-                filetypes=[("Pickle files", "*.pkl"), ("All files", "*.*")],
-                title="Save Neural Network"
-            )
-            
-            if file_path:
-                self.net.save_network(file_path)
-                self.status_var.set(f"Network saved to {os.path.basename(file_path)}")
-                messagebox.showinfo("Success", f"Network saved successfully to:\n{file_path}")
-        except Exception as e:
-            messagebox.showerror("Error", f"Failed to save network:\n{str(e)}")
-    
-    def load_network_file(self):
-        """Load a trained network from a user-selected file"""
-        try:
-            file_path = filedialog.askopenfilename(
-                filetypes=[("Pickle files", "*.pkl"), ("All files", "*.*")],
-                title="Load Neural Network"
-            )
-            
-            if file_path:
-                try:
-                    # Load the network using the static method
-                    self.net = network.Network.from_file(file_path)
-                    
-                    self.status_var.set(f"Network loaded from {os.path.basename(file_path)}")
-                    messagebox.showinfo("Success", 
-                                      f"Network loaded successfully!\n"
-                                      f"Architecture: {self.net.sizes}")
-                        
-                except Exception as load_error:
-                    messagebox.showerror("Error", f"Failed to load network:\n{str(load_error)}")
-                    
-        except Exception as e:
-            messagebox.showerror("Error", f"Error loading network:\n{str(e)}")
+            self.root.after(0, lambda: self._train_btn.configure(state=tk.NORMAL))
+            self.root.after(0, lambda: self._progress_frame.pack_forget())
 
+    # -- save / load ---------------------------------------------------------
+    def save_network_file(self):
+        if self.net is None:
+            messagebox.showwarning("No Network", "Train or load a network first.")
+            return
+        path = filedialog.asksaveasfilename(
+            defaultextension=".pkl",
+            filetypes=[("Pickle files", "*.pkl"), ("All files", "*.*")],
+            title="Save Neural Network",
+        )
+        if path:
+            self.net.save_network(path)
+            self._status_var.set(f"Network saved to {os.path.basename(path)}")
+
+    def load_network_file(self):
+        path = filedialog.askopenfilename(
+            filetypes=[("Pickle files", "*.pkl"), ("All files", "*.*")],
+            title="Load Neural Network",
+        )
+        if not path:
+            return
+        try:
+            self.net = network.Network.from_file(path)
+            self._set_net_status(f"Loaded: {self.net.sizes}")
+            self._status_var.set(f"Loaded network from {os.path.basename(path)}")
+        except Exception as e:
+            messagebox.showerror("Error", f"Failed to load network:\n{e}")
+
+    # -- show training sample ------------------------------------------------
     def show_random_training_image(self):
-        """Show a random image from the training dataset"""
-        # Check if training data is loaded
         if self.training_data is None:
             try:
-                # Try to load MNIST data
-                training_data, validation_data, test_data = mnist_loader.load_data_wrapper()
-                self.training_data = list(training_data)
-                self.test_data = list(test_data)
+                self._status_var.set("Loading MNIST data…")
+                tr, _v, te = mnist_loader.load_data_wrapper()
+                self.training_data = list(tr)
+                self.test_data = list(te)
             except Exception as e:
-                messagebox.showerror("Error", f"Failed to load MNIST data:\n{str(e)}")
+                messagebox.showerror("Error", f"Failed to load MNIST data:\n{e}")
                 return
-        
-        if not self.training_data:
-            messagebox.showwarning("No Data", "No training data available!")
-            return
-        
-        try:
-            # Get a random training sample
-            import random
-            random_sample = random.choice(self.training_data)
-            image_data, label = random_sample
-            
-            # Convert the image data to display format
-            # MNIST data comes as a 784x1 vector, reshape to 28x28
-            img_2d = image_data.reshape(28, 28)
-            
-            # Convert to 0-255 range for display (MNIST data is already 0-1 normalized)
-            img_display = (img_2d * 255).astype(np.uint8)
-            
-            # Create PIL image
-            pil_img = Image.fromarray(img_display, mode='L')
-            
-            # Scale up for better visibility (28x28 -> 140x140, 5x scaling)
-            pil_img = pil_img.resize((140, 140), Image.Resampling.NEAREST)
-            
-            # Clear the processed canvas
-            self.processed_canvas.delete("all")
-            
-            # Convert PIL image to tkinter PhotoImage and display
-            try:
-                from PIL import ImageTk
-                photo = ImageTk.PhotoImage(pil_img)
-                self.processed_canvas.create_image(70, 70, image=photo)
-                # Store reference to prevent garbage collection
-                self.photo_refs = [photo]  # Clear previous and store new reference
-            except ImportError:
-                # Fallback: show text description if PIL ImageTk not available
-                self.processed_canvas.create_text(70, 70, text="Training\nimage\n(PIL ImageTk\nnot available)", 
-                                                justify=tk.CENTER, font=("Arial", 8))
-            
-            # Show the actual label in the result display
-            actual_digit = np.argmax(label)
-            self.result_var.set(f"Training: {actual_digit}\n(Actual label)")
-            
-            # Update status bar
-            self.status_var.set(f"Showing random training image - actual digit: {actual_digit}")
-            
-        except Exception as e:
-            messagebox.showerror("Error", f"Error displaying training image:\n{str(e)}")
 
+        sample_img, sample_label = random.choice(self.training_data)
+        digit = int(np.argmax(sample_label))
+
+        # Show in the thumbnail panel
+        self._show_thumbnail(sample_img)
+
+        self._digit_var.set(str(digit))
+        self._confidence_var.set("MNIST training sample")
+        self._draw_bars(np.zeros(10))
+        self._status_var.set(f"Showing random MNIST sample – label: {digit}")
+
+    # -- recognition ---------------------------------------------------------
     def recognize_digit(self):
-        """Recognize the digit drawn on the canvas"""
         if self.net is None:
-            # Try to load a previously trained network
-            if not self.load_trained_network():
-                messagebox.showwarning(
-                    "No Network", 
-                    "No trained network found. Please train the network first."
-                )
+            if not self._try_load_default():
+                messagebox.showwarning("No Network", "Train or load a network first.")
                 return
-        
+
+        img_vec = self._prepare_image()
+        self._show_thumbnail(img_vec)
+
+        output = self.net.feedforward(img_vec)
+        probs = output.flatten()
+        predicted = int(np.argmax(probs))
+        conf = probs[predicted]
+
+        self._digit_var.set(str(predicted))
+        self._confidence_var.set(f"Confidence: {conf:.1%}")
+        self._draw_bars(probs)
+        self._status_var.set(f"Predicted digit: {predicted}  ({conf:.1%})")
+
+    def _try_load_default(self):
         try:
-            # Convert canvas drawing to 28x28 grayscale image
-            digit_image = self.prepare_canvas_for_recognition()
-            
-            # Show the processed image in the side panel
-            self.update_processed_image_display(digit_image)
-            
-            # Use the network to predict the digit
-            output = self.net.feedforward(digit_image)
-            predicted_digit = np.argmax(output)
-            confidence = output[predicted_digit][0]
-            
-            # Show result in the text box below processed image
-            self.result_var.set(f"{predicted_digit}\n({confidence:.1%})")
-            
-            # Update status bar with general message
-            self.status_var.set("Digit recognition completed!")
-            
-        except Exception as e:
-            messagebox.showerror("Recognition Error", f"Error during recognition:\n{str(e)}")
-    
-    def prepare_canvas_for_recognition(self):
-        """Convert the canvas drawing to a format suitable for the neural network"""
-        # Get the canvas as a PIL image
-        canvas_image = self.image.copy()
-        
-        # Convert to grayscale first
-        canvas_image = canvas_image.convert('L')
-        
-        # Find the bounding box of the drawn content to center it
-        bbox = canvas_image.getbbox()
-        
+            self.net = network.Network.from_file("trained_network.pkl")
+            self._set_net_status(f"Loaded: {self.net.sizes}")
+            return True
+        except Exception:
+            return False
+
+    # -- image preprocessing -------------------------------------------------
+    def _prepare_image(self):
+        canvas_img = self.image.copy().convert("L")
+        bbox = canvas_img.getbbox()
         if bbox is None:
-            # If nothing is drawn, return a blank 28x28 image
-            img_array = np.zeros((784, 1), dtype=np.float32)
-            return img_array
-        
-        # Crop to the bounding box with some padding
-        left, top, right, bottom = bbox
-        width = right - left
-        height = bottom - top
-        
-        # Add padding (20% of the larger dimension)
-        padding = max(width, height) * 0.2
-        left = max(0, left - padding)
-        top = max(0, top - padding)
-        right = min(canvas_image.width, right + padding)
-        bottom = min(canvas_image.height, bottom + padding)
-        
-        # Crop the image to the padded bounding box
-        cropped_image = canvas_image.crop((int(left), int(top), int(right), int(bottom)))
-        
-        # Create a square image by padding with white
-        crop_width, crop_height = cropped_image.size
-        max_dim = max(crop_width, crop_height)
-        
-        # Create a new square white image
-        square_image = Image.new('L', (max_dim, max_dim), 255)  # 255 = white
-        
-        # Paste the cropped image in the center
-        paste_x = (max_dim - crop_width) // 2
-        paste_y = (max_dim - crop_height) // 2
-        square_image.paste(cropped_image, (paste_x, paste_y))
-        
-        # Resize to 28x28 with high-quality anti-aliasing
-        # Using LANCZOS (high-quality) resampling for smooth anti-aliasing
-        resized_image = square_image.resize((28, 28), Image.Resampling.LANCZOS)
-        
-        # Convert to numpy array
-        img_array = np.array(resized_image, dtype=np.float32)
-        
-        # Apply gentle contrast enhancement (less aggressive than before)
-        # Apply contrast stretching to use full 0-255 range
-        min_val = np.min(img_array)
-        max_val = np.max(img_array)
-        if max_val > min_val:  # Avoid division by zero
-            img_array = (img_array - min_val) * 255.0 / (max_val - min_val)
-        
-        # Apply morphological dilation to thicken strokes (like MNIST)
+            return np.zeros((784, 1), dtype=np.float32)
+
+        # Crop with 20 % padding
+        l, t, r, b = bbox
+        pad = max(r - l, b - t) * 0.2
+        l = max(0, l - pad)
+        t = max(0, t - pad)
+        r = min(canvas_img.width, r + pad)
+        b = min(canvas_img.height, b + pad)
+        cropped = canvas_img.crop((int(l), int(t), int(r), int(b)))
+
+        # Make square
+        cw, ch = cropped.size
+        mx = max(cw, ch)
+        square = Image.new("L", (mx, mx), 255)
+        square.paste(cropped, ((mx - cw) // 2, (mx - ch) // 2))
+
+        # Resize to 28×28
+        resized = square.resize((28, 28), Image.Resampling.LANCZOS)
+        arr = np.array(resized, dtype=np.float32)
+
+        # Invert (MNIST = white-on-black: 0 = background, 255 = stroke)
+        arr = 255.0 - arr
+
+        # Thicken strokes slightly to match MNIST-like appearance.
+        # Use a cross-shaped kernel (4-connected, not 8) for moderate dilation.
         try:
-            from scipy import ndimage
-            # Create a structuring element (small cross pattern for thickening)
-            structure = np.array([[0,1,0],[0,1,0],[0,1,0]], dtype=bool)
-            
-            # Apply dilation before thresholding to thicken the strokes
-            # First, create a binary mask of the drawn areas
-            binary_mask = img_array < 220  # Areas that are not pure white
-            dilated_mask = ndimage.binary_dilation(binary_mask, structure=structure, iterations=1)
-            
-            # Apply the dilation effect: make dilated areas darker
-            img_array = np.where(dilated_mask, img_array * 0.6, img_array)
-            
-            # Apply gentler threshold after dilation
-            threshold = 200  # Adjusted threshold after dilation
-            img_array = np.where(img_array < threshold, 
-                               img_array * 0.5,  # Less aggressive darkening after dilation
-                               255.0)             # Keep light areas white
+            from scipy.ndimage import grey_dilation
+            cross = np.array([[0, 1, 0],
+                              [1, 1, 1],
+                              [0, 1, 0]], dtype=bool)
+            arr = grey_dilation(arr, footprint=cross)
         except ImportError:
-            # Fallback: use more aggressive thresholding to simulate thickening
-            threshold = 160  # Lower threshold to capture more pixels as "digit"
-            img_array = np.where(img_array < threshold, 
-                               img_array * 0.5,  # More aggressive darkening without dilation
-                               255.0)             # Keep light areas white
-        
-        # Apply a softer binary threshold to reduce extreme processing
-        # This is gentler than the previous approach
-        # binary_threshold = 160  # Increased from 128 to be less harsh
-        # img_array = np.where(img_array < binary_threshold, 
-        #                    img_array * 0.5,  # Darken but not to pure black
-        #                    255.0)
-        
-        # Invert colors (MNIST has white digits on black background)
-        # Our canvas has black digits on white background
-        img_array = 255.0 - img_array
-        
-        # Normalize to 0-1 range (0 = black background, 1 = white digit)
-        img_array = img_array / 255.0
-        
-        # Ensure we have the exact 784-dimensional vector (28*28 = 784)
-        assert img_array.shape == (28, 28), f"Expected (28, 28), got {img_array.shape}"
-        
-        # Reshape to column vector (784, 1) as expected by the network
-        img_array = img_array.reshape(784, 1)
-        
-        # Verify we have exactly 784 dimensions
-        assert img_array.shape == (784, 1), f"Expected (784, 1), got {img_array.shape}"
-        
-        return img_array
-    
-    def update_processed_image_display(self, img_array):
-        """Update the processed image display in the side panel"""
-        # Convert back to 28x28 for visualization
-        img_2d = img_array.reshape(28, 28)
-        
-        # Convert to 0-255 range for display
-        img_display = (img_2d * 255).astype(np.uint8)
-        
-        # Create PIL image
-        pil_img = Image.fromarray(img_display)
-        
-        # Scale up for better visibility (28x28 -> 140x140, 5x scaling)
-        pil_img = pil_img.resize((140, 140), Image.Resampling.NEAREST)
-        
-        # Clear the processed canvas
-        self.processed_canvas.delete("all")
-        
-        # Convert PIL image to tkinter PhotoImage and display
+            # Manual cross-shaped max-pool dilation (up/down/left/right only)
+            padded = np.pad(arr, 1, mode="constant", constant_values=0)
+            arr = np.maximum.reduce([
+                padded[1:29, 1:29],   # centre
+                padded[0:28, 1:29],   # up
+                padded[2:30, 1:29],   # down
+                padded[1:29, 0:28],   # left
+                padded[1:29, 2:30],   # right
+            ])
+
+        # Normalise to 0-1
+        hi = arr.max()
+        if hi > 0:
+            arr = arr / hi
+
+        return arr.reshape(784, 1)
+
+    # -- bar-chart drawing ---------------------------------------------------
+    def _draw_bars(self, probs):
+        c = self._bar_canvas
+        c.delete("all")
+        w = c.winfo_width() or 340
+        h = c.winfo_height() or 180
+        if w < 10 or h < 10:
+            return
+
+        n = len(probs)
+        margin_l, margin_r, margin_t, margin_b = 24, 8, 8, 20
+        chart_w = w - margin_l - margin_r
+        chart_h = h - margin_t - margin_b
+        bar_w = chart_w / n * 0.7
+        gap = chart_w / n * 0.3
+
+        best = int(np.argmax(probs))
+        for i, p in enumerate(probs):
+            x0 = margin_l + i * (bar_w + gap)
+            bar_h = max(1, p * chart_h)
+            y0 = margin_t + chart_h - bar_h
+            y1 = margin_t + chart_h
+            fill = ACCENT if i == best and p > 0 else BAR_BG
+            c.create_rectangle(x0, y0, x0 + bar_w, y1, fill=fill, outline="")
+            # label
+            c.create_text(x0 + bar_w / 2, y1 + 10, text=str(i),
+                          font=("Segoe UI", 8), fill="#374151")
+            if p > 0.01:
+                c.create_text(x0 + bar_w / 2, y0 - 6, text=f"{p:.0%}",
+                              font=("Segoe UI", 7), fill="#374151")
+
+    # -- thumbnail display ---------------------------------------------------
+    def _show_thumbnail(self, img_vec):
+        img_2d = (img_vec.reshape(28, 28) * 255).astype(np.uint8)
+        pil = Image.fromarray(img_2d, mode="L").resize((56, 56), Image.Resampling.NEAREST)
+        photo = ImageTk.PhotoImage(pil)
+        self._thumb_canvas.delete("all")
+        self._thumb_canvas.create_image(28, 28, image=photo)
+        self._photo_refs = [photo]
+
+    # -- saved-network helper ------------------------------------------------
+    def save_trained_network(self):
+        if self.net is None:
+            return
         try:
-            from PIL import ImageTk
-            photo = ImageTk.PhotoImage(pil_img)
-            self.processed_canvas.create_image(70, 70, image=photo)
-            # Store reference to prevent garbage collection
-            if not hasattr(self, 'photo_refs'):
-                self.photo_refs = []
-            self.photo_refs = [photo]  # Clear previous and store new reference
-        except ImportError:
-            # Fallback: show text description if PIL ImageTk not available
-            self.processed_canvas.create_text(70, 70, text="Processed\n28x28 image\n(PIL ImageTk\nnot available)", 
-                                            justify=tk.CENTER, font=("Arial", 8))
+            self.net.save_network("trained_network.pkl")
+        except Exception as e:
+            print(f"Failed to save network: {e}")
+
 
 def main():
-    """Main function to run the application"""
     root = tk.Tk()
     app = DrawingApp(root)
-    
-    # Center the window
+    # Centre on screen
     root.update_idletasks()
-    x = (root.winfo_screenwidth() // 2) - (root.winfo_width() // 2)
-    y = (root.winfo_screenheight() // 2) - (root.winfo_height() // 2)
+    x = (root.winfo_screenwidth() - root.winfo_width()) // 2
+    y = (root.winfo_screenheight() - root.winfo_height()) // 2
     root.geometry(f"+{x}+{y}")
-    
     root.mainloop()
 
 

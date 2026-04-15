@@ -44,7 +44,7 @@ class Network(object):
         return a
 
     def SGD(self, training_data, epochs, mini_batch_size, eta,
-            test_data=None):
+            test_data=None, epoch_callback=None):
         """Train the neural network using mini-batch stochastic
         gradient descent.  The ``training_data`` is a list of tuples
         ``(x, y)`` representing the training inputs and the desired
@@ -52,7 +52,9 @@ class Network(object):
         self-explanatory.  If ``test_data`` is provided then the
         network will be evaluated against the test data after each
         epoch, and partial progress printed out.  This is useful for
-        tracking progress, but slows things down substantially."""
+        tracking progress, but slows things down substantially.
+        If ``epoch_callback`` is provided, it will be called after each
+        epoch with (epoch, epochs, accuracy_or_none)."""
         if test_data: n_test = len(test_data)
         n = len(training_data)
         for j in range(epochs):
@@ -64,11 +66,16 @@ class Network(object):
             for mini_batch in mini_batches:
                 self.update_mini_batch(mini_batch, eta)
             time2 = time.time()
+            accuracy = None
             if test_data:
+                correct = self.evaluate(test_data)
+                accuracy = correct / n_test
                 print("Epoch {0}: {1} / {2}, took {3:.2f} seconds".format(
-                    j, self.evaluate(test_data), n_test, time2-time1))
+                    j, correct, n_test, time2-time1))
             else:
                 print("Epoch {0} complete in {1:.2f} seconds".format(j, time2-time1))
+            if epoch_callback:
+                epoch_callback(j, epochs, accuracy)
 
     def update_mini_batch(self, mini_batch, eta):
         """Update the network's weights and biases by applying
